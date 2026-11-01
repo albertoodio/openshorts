@@ -2493,6 +2493,32 @@ async def _webhook_clip_entries(job_id, job):
     return entries
 
 
+def _post_webhook_guarded(url, body: bytes, headers):
+    """POST with name resolution and connect on ONE thread inside
+    ``ssrf_guard.guarded()``.
+
+    ``assert_public_url`` checks the address the host resolves to, but an
+    async client resolves the name again on another thread, where the guard is
+    not active. A DNS answer that flips from a public to a private address
+    between those two lookups (DNS rebinding) would then be connected to. Here
+    the only lookup that matters, the one the connection uses, can only return
+    public addresses, so the address connected to is one that passed the check.
+    """
+    import ssrf_guard
+    from security_utils import UnsafeURLError
+    try:
+        with ssrf_guard.guarded(), httpx.Client(timeout=WEBHOOK_TIMEOUT,
+                                                follow_redirects=False) as client:
+            return client.post(url, content=body, headers=headers)
+    except httpx.ConnectError as e:
+        cause = e
+        while cause is not None:
+            if isinstance(cause, ssrf_guard.BlockedAddressError):
+                raise UnsafeURLError(f"{url} resolved to a non-public address at connect time") from e
+            cause = cause.__cause__ or cause.__context__
+        raise
+
+
 async def _deliver_webhook(url, body: bytes, secret):
     headers = {"Content-Type": "application/json", "User-Agent": "OpenShorts-Webhook/1.0"}
     if secret:
@@ -2505,9 +2531,7 @@ async def _deliver_webhook(url, body: bytes, secret):
         try:
             # Re-resolve on every attempt: the submit-time check is stale by now.
             await loop.run_in_executor(None, assert_public_url, url)
-            async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT,
-                                         follow_redirects=False) as client:
-                resp = await client.post(url, content=body, headers=headers)
+            resp = await loop.run_in_executor(None, _post_webhook_guarded, url, body, headers)
             if resp.status_code < 300:
                 print(f"🪝 Webhook delivered to {url} (attempt {attempt})")
                 return
