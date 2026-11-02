@@ -508,3 +508,11 @@ Contributions are welcome! Whether it's adding new AI models, improving the lip-
 MIT License for the core application — OpenShorts is yours to use, modify, and scale.
 
 **Exception:** the [`cloud/`](cloud/LICENSE) directory (billing, managed keys, and the hosted-service infrastructure behind the optional `BILLING_ENABLED` flag) is source-available under the OpenShorts Commercial License. You can read it, modify it, and self-host it for personal or internal use, but you can't offer it to third parties as a paid/hosted service. Self-hosting the core app never requires this directory.
+
+## Self-host publishing state
+
+Accepted social uploads retain their request ID and owner in the private `.cache/social-posts/requests.sqlite3` ledger. Preserve that state directory when moving the installation. Provider keys, captions and media are not stored there. A tracking warning after acceptance means keep the request ID and retry status, not the publication POST; repeated submissions are not yet idempotent.
+
+Browser-only video edits are available to download and publish manually. Automatic publishing is blocked for those edits and while an edit is running, so it cannot silently send an earlier server version.
+
+Run the offline UI regressions with `node --test tests/*.test.cjs`; CI runs them alongside dashboard lint and build.

@@ -693,7 +693,19 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     // Managed (cloud plan/trial) users post with the server-side key — no BYOK needed
     const canPost = isManaged || (uploadPostKey && uploadUserId);
 
+    const hasUnpublishedEdits = Boolean(
+        activeLayers.subtitles || activeLayers.hook || activeLayers.effects
+        || String(currentVideoUrl || '').startsWith('blob:')
+    );
+    const editInProgress = isEditing || isSubtitling || isHooking || isTranslating;
+
     const handlePost = async () => {
+        if (hasUnpublishedEdits || editInProgress) {
+            setPostResult({ success: false, msg: hasUnpublishedEdits
+                ? "Download this edited version and publish the downloaded file manually. Automatic publishing is unavailable for this edit."
+                : "Wait for the current edit to finish before publishing." });
+            return;
+        }
         if (!canPost) {
             setPostResult({ success: false, msg: "Missing API Key or User ID." });
             return;
@@ -750,6 +762,11 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
             }
 
             const sent = await res.json().catch(() => ({}));
+            if (sent?.tracking_persistence === 'pending') {
+                const warning = sent.tracking_warning || "Upload accepted. Tracking is pending; do not submit the post again.";
+                setPostResult({ success: true, msg: `${warning} Request ID: ${String(sent.request_id || 'unavailable')}` });
+                return;
+            }
             if (isScheduling || !sent?.request_id) {
                 setPostResult({ success: true, msg: isScheduling ? "Scheduled successfully!" : "Sent for publishing." });
                 setTimeout(() => {
@@ -1098,7 +1115,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     ) : (
                         <button
                             onClick={handlePost}
-                            disabled={posting || !canPost}
+                            disabled={posting || !canPost || hasUnpublishedEdits || editInProgress}
                             className="btn-primary w-full"
                         >
                             {posting ? <><Loader2 size={16} className="animate-spin" /> {isScheduling ? 'scheduling…' : 'publishing…'}</> : <><Share2 size={16} /> {isScheduling ? 'schedule post' : 'publish now'}</>}
@@ -1106,6 +1123,15 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     )
                 }
             >
+                {hasUnpublishedEdits && (
+                    <p className="mb-4 text-sm text-warn" role="status">
+                        Download this edited version and publish the downloaded file manually.
+                        Automatic publishing is unavailable for this edit.
+                    </p>
+                )}
+                {editInProgress && !hasUnpublishedEdits && (
+                    <p className="mb-4 text-sm text-warn" role="status">Wait for the current edit to finish before publishing.</p>
+                )}
                 {!canPost && (
                     <div className="mb-4 px-3 py-2 rounded-input text-xs text-warn bg-[color-mix(in_oklab,var(--color-warn)_10%,transparent)] flex items-start gap-2">
                         <AlertCircle size={14} className="mt-0.5 shrink-0" />

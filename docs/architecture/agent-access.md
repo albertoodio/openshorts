@@ -119,3 +119,20 @@ clips-ready email: the caller polls or gets the webhook. The job records
 
 Every 402 (`quota_exceeded`, `no_plan`) goes through `app.payment_required`: it adds `upgrade_url` (`/#/pricing?plan=starter&src=api`, which opens the Starter checkout) and repeats the link inside `message`, since MCP clients and SDKs often show only the message. The MCP `get_quota` tool returns the same `upgrade_url` for free or unentitled users, and the server instructions tell the agent to hand that link to the user.
 
+
+## Self-host social upload tracking
+
+Accepted async uploads keep their request ID and owner in
+`.cache/social-posts/requests.sqlite3`, outside public media. Preserve this
+private state directory when replacing a container; local Compose already mounts
+the application directory. No provider key, caption or media is stored there.
+Cloud continues to use its existing ownership path and never falls back to this
+self-host ledger.
+
+A storage failure after provider acceptance still returns that acceptance and
+`request_id`, with `tracking_persistence: "pending"` and `tracking_warning`.
+Callers must retain the ID and display the warning instead of repeating the POST.
+A failed status read returns `tracking_unavailable`; retry status, not publication.
+The ledger does not make a repeated POST idempotent and does not reconstruct IDs
+accepted before the ledger existed. Keep/back up the state when migrating hosts;
+retention and cleanup of completed history are separate policy decisions.

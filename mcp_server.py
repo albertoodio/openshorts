@@ -316,7 +316,8 @@ TOOLS = [
         "description": (
             "Post one clip to the user's connected accounts (TikTok lands as a "
             "draft in the app; Instagram and YouTube publish directly). Requires "
-            "a connected social profile (cloud) or an Upload-Post key (self-host). "
+            "a connected social profile (cloud), or an Upload-Post key plus "
+            "user_id naming its profile (self-host; ignored in cloud mode). "
             "Optionally schedule with an ISO-8601 scheduled_date."
         ),
         "inputSchema": {
@@ -327,6 +328,11 @@ TOOLS = [
                 "platforms": {
                     "type": "array",
                     "items": {"type": "string", "enum": ["tiktok", "instagram", "youtube"]},
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "Upload-Post profile username, required for self-host. "
+                                   "Ignored in cloud mode, which always uses the owner's profile.",
                 },
                 "title": {"type": "string"},
                 "description": {"type": "string"},
@@ -580,7 +586,7 @@ async def _tool_recut_clip(client, args):
 async def _tool_publish_clip(client, args):
     body = {"job_id": args["job_id"], "clip_index": args["clip_index"],
             "platforms": args["platforms"]}
-    for k in ("title", "description", "scheduled_date", "timezone"):
+    for k in ("user_id", "title", "description", "scheduled_date", "timezone"):
         if args.get(k) is not None:
             body[k] = args[k]
     resp = await _job_call(client, "POST", "/api/social/post", args["job_id"], json=body)

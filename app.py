@@ -33,6 +33,7 @@ import recut
 import layout_ranges
 import watermarked
 import media_auth
+from social_post_store import SocialPostStore
 
 load_dotenv()
 
@@ -6233,8 +6234,45 @@ def youtube_title(title) -> str:
 
 # Async uploads started here, so the status proxy below only ever answers the
 # account that started them (managed users share one Upload-Post key).
-# request_id -> owner id; in memory, an unknown id after a restart is "unknown".
+# Cloud ownership remains in memory; self-host IDs also survive a restart in
+# private state, outside the media directories served by /videos and /thumbnails.
 _post_request_owners: dict = {}
+_selfhost_post_store = SocialPostStore(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".cache", "social-posts", "requests.sqlite3"))
+
+
+def _remember_post_request(request_id, owner):
+    # A provider ID must never transfer ownership, even if persistence fails.
+    if request_id in _post_request_owners and _post_request_owners[request_id] != owner:
+        print(f"[social-tracking-conflict] request={request_id!r}")
+        return False
+    if BILLING_ENABLED:
+        _post_request_owners[request_id] = owner
+        return True
+    try:
+        _selfhost_post_store.record(request_id, owner)
+    except ValueError:
+        # Includes a durable owner conflict: do not cache the rejected owner.
+        print(f"[social-tracking-rejected] request={request_id!r}")
+        return False
+    except Exception as exc:
+        # The provider already accepted the upload. Keep safe in-memory tracking
+        # without suggesting a repeated POST. If the disk cannot verify an ID's
+        # owner, fail closed rather than replace a possible durable owner.
+        if request_id not in _post_request_owners:
+            try:
+                found, stored_owner = _selfhost_post_store.lookup(request_id)
+            except Exception:
+                print(f"[social-tracking-pending] request={request_id!r} error={type(exc).__name__}")
+                return False
+            if found and stored_owner != owner:
+                print(f"[social-tracking-pending] request={request_id!r} error={type(exc).__name__}")
+                return False
+        _post_request_owners[request_id] = owner
+        print(f"[social-tracking-pending] request={request_id!r} error={type(exc).__name__}")
+        return False
+    _post_request_owners[request_id] = owner
+    return True
 
 
 async def _platforms_needing_reconnect(profile, platforms):
@@ -6386,7 +6424,12 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
 
         out = response.json()
         if isinstance(out, dict) and out.get("request_id"):
-            _post_request_owners[str(out["request_id"])] = await _owner_id(request)
+            tracked = _remember_post_request(str(out["request_id"]), await _owner_id(request))
+            if not tracked:
+                out["tracking_persistence"] = "pending"
+                out["tracking_warning"] = (
+                    "Upload already accepted. Keep request_id and check its status; "
+                    "do not submit the post again. Tracking may be unavailable after a restart.")
         return out
 
     except Exception as e:
@@ -6402,8 +6445,19 @@ async def social_post_status(request_id: str, request: Request):
     itself can still fail per platform, and the dashboard used to say "Posted
     successfully!" either way.
     """
-    owner = _post_request_owners.get(request_id)
-    if owner is None:
+    # Known self-host requests have an anonymous owner (None). Cloud never
+    # consults this local self-host store, preserving its ownership boundary.
+    if request_id in _post_request_owners:
+        owner = _post_request_owners[request_id]
+    elif not BILLING_ENABLED:
+        try:
+            found, owner = _selfhost_post_store.lookup(request_id)
+        except Exception:
+            return {"status": "tracking_unavailable", "request_id": request_id,
+                    "message": "Tracking is temporarily unavailable. Retry the status check; do not submit the post again."}
+        if not found:
+            return {"status": "unknown"}
+    else:
         return {"status": "unknown"}
     if owner != await _owner_id(request):
         raise HTTPException(status_code=404, detail="Not found")
