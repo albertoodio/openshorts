@@ -1,4 +1,4 @@
-FROM node:18-bookworm-slim
+FROM node:22-bookworm-slim
 
 # Install Chromium and FFmpeg for Remotion rendering
 RUN apt-get update && \
@@ -12,20 +12,20 @@ ENV OUTPUT_DIR=/output
 WORKDIR /app
 
 # Copy render service source
-COPY render-service/package.json ./
-RUN npm install
+COPY render-service/package.json render-service/package-lock.json ./
+RUN npm ci
 
 COPY render-service/tsconfig.json ./
 COPY render-service/src/ ./src/
 
 # Copy remotion source for bundling
-COPY remotion/package.json /app/remotion/package.json
+COPY remotion/package.json remotion/package-lock.json /app/remotion/
 COPY remotion/tsconfig.json /app/remotion/tsconfig.json
 COPY remotion/src/ /app/remotion/src/
 COPY remotion/public/ /app/remotion/public/
 
 # Install remotion deps
-RUN cd /app/remotion && npm install
+RUN cd /app/remotion && npm ci
 
 # Build TypeScript
 RUN npm run build

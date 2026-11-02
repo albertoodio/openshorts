@@ -52,7 +52,12 @@ app.use("/output", express.static(OUTPUT_DIR));
 
 // Health check
 app.get("/health", (_req, res) => {
-  res.json({ ok: true });
+  res.json({
+    ok: true,
+    queued: [...renderJobs.values()].filter(job => job.status === "queued").length,
+    rendering: [...renderJobs.values()].filter(job => job.status === "rendering").length,
+    sharedResource: Boolean(process.env.RENDER_RESOURCE_LOCK),
+  });
 });
 
 // Submit a render job

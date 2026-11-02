@@ -3,6 +3,7 @@ import path from "node:path";
 import { selectComposition, renderMedia } from "@remotion/renderer";
 import { getBundleLocation } from "./bundle.js";
 import { renderJobs } from "./server.js";
+import { acquireRenderSlot } from "./resource-slot.js";
 
 export interface RenderParams {
   renderId: string;
@@ -33,7 +34,9 @@ export async function executeRender(params: RenderParams): Promise<void> {
     return;
   }
 
+  let release: (() => Promise<void>) | undefined;
   try {
+    release = await acquireRenderSlot();
     job.status = "rendering";
     job.progress = 0;
 
@@ -92,5 +95,7 @@ export async function executeRender(params: RenderParams): Promise<void> {
     job.error = err instanceof Error ? err.message : String(err);
 
     console.error(`[render-worker] Render ${renderId} failed:`, err);
+  } finally {
+    if (release) await release();
   }
 }

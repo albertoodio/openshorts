@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from security_utils import validate_thumbnail_session_id
 
 # Text/analysis model (titles, concepts, description). Deliberately NOT tied to
 # GEMINI_MODEL: the pipeline runs flash-lite for a closed-choice layout pick,
@@ -262,6 +263,7 @@ def extract_face_frames(video_path, session_id, n=5, samples=40):
     near-duplicates of one second. Saved as JPEGs under the session's
     thumbnails dir. Returns [{"url", "path", "time", "face": [x, y, w, h]}].
     """
+    validate_thumbnail_session_id(session_id)
     import cv2
     from main import detect_face_candidates
 
@@ -660,6 +662,7 @@ def generate_thumbnail(api_key, title, session_id, face_image_path=None, bg_imag
     person reference when the user picked a frame instead of uploading a photo.
     Returns [{"url", "text", "why"}] (only the ones that rendered).
     """
+    validate_thumbnail_session_id(session_id)
     client = genai.Client(api_key=api_key)
     output_dir = os.path.join("output", "thumbnails", session_id)
     os.makedirs(output_dir, exist_ok=True)

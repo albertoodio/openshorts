@@ -10,6 +10,7 @@ loopback, link-local, reserved, and the 100.64.0.0/10 range Tailscale uses).
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 from urllib.parse import urlparse
 
@@ -111,3 +112,10 @@ def assert_public_url(url: str) -> str:
         if not _ip_is_public(ip):
             raise UnsafeURLError(f"Host {host!r} resolves to a non-public address: {ip}")
     return url
+
+
+def validate_thumbnail_session_id(value: object) -> str:
+    """A session is an identifier, never a filesystem path."""
+    if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", value) is None:
+        raise ValueError("Invalid thumbnail session ID: use 1-128 letters, digits, underscores or hyphens, starting with a letter or digit")
+    return value

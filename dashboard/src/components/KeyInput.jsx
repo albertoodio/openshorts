@@ -7,7 +7,9 @@ export default function KeyInput({ onKeySet, savedKey }) {
     const [isSaved, setIsSaved] = useState(!!savedKey);
 
     useEffect(() => {
-        if (savedKey) setKey(savedKey);
+        setKey(savedKey || '');
+        setIsSaved(Boolean(savedKey));
+        setIsVisible(false);
     }, [savedKey]);
 
     const handleSave = () => {

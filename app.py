@@ -21,7 +21,7 @@ import socket
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from typing import Any, Dict, Optional, List
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, ExitStack, suppress
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -34,6 +34,8 @@ import layout_ranges
 import watermarked
 import media_auth
 from social_post_store import SocialPostStore
+from local_resources import resource_slot, resource_status, ResourceWaitTimeout
+from thumbnail_retention import session_lease, cleanup_sessions, SessionBusy, legacy_upload_session_id
 
 load_dotenv()
 
@@ -46,6 +48,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Configuration
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
+RENDER_RESOURCE_LOCK = os.environ.get("RENDER_RESOURCE_LOCK") or None
+RENDER_RESOURCE_WAIT_SECONDS = float(os.environ.get("RENDER_RESOURCE_WAIT_SECONDS", "300"))
 MAX_FILE_SIZE_MB = 2048  # 2GB limit
 
 # How TikTok receives our uploads. MEDIA_UPLOAD lands the video in the user's
@@ -1853,17 +1857,36 @@ def _sweep_expired_job_dirs(now):
         jobs.pop(job_id, None)
 
 
+@contextmanager
+def _thumbnail_upload_cleanup():
+    lease = session_lease(os.path.join(THUMBNAIL_LEASE_DIR, ".uploads"), "cleanup", exclusive=True)
+    try:
+        lease.__enter__()
+    except (SessionBusy, OSError):
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        lease.__exit__(None, None, None)
+
+
 def _sweep_expired_uploads(now):
     """Drop source uploads older than JOB_RETENTION_SECONDS, except the source
     of a job that is still queued or running."""
-    for filename in os.listdir(UPLOAD_DIR):
-        file_path = os.path.join(UPLOAD_DIR, filename)
-        try:
-            if (now - os.path.getmtime(file_path) > JOB_RETENTION_SECONDS
-                    and not _job_is_active(_upload_job_id(filename), now)):
-                os.remove(file_path)
-        except Exception:
-            pass
+    with _thumbnail_upload_cleanup() as idle:
+        if not idle:
+            return
+        for filename in os.listdir(UPLOAD_DIR):
+            file_path = os.path.join(UPLOAD_DIR, filename)
+            if legacy_upload_session_id(filename) or (filename.startswith("thumb_") and os.path.isdir(file_path)):
+                continue  # Thumbnail Studio owns the whole session's retention.
+            try:
+                if (now - os.path.getmtime(file_path) > JOB_RETENTION_SECONDS
+                        and not _job_is_active(_upload_job_id(filename), now)):
+                    os.remove(file_path)
+            except Exception:
+                pass
 
 
 def _enforce_uploads_size_cap():
@@ -1872,31 +1895,35 @@ def _enforce_uploads_size_cap():
     Sources are only needed while a job runs (and for the preview afterwards),
     but they're the biggest files on disk — up to MAX_FILE_SIZE_MB each.
     """
-    cap = UPLOADS_MAX_GB * 1024 ** 3
-    if cap <= 0:
-        return
-    used = _dir_size(UPLOAD_DIR)
-    if used <= cap:
-        return
-    files = []
-    for name in os.listdir(UPLOAD_DIR):
-        p = os.path.join(UPLOAD_DIR, name)
-        if os.path.isfile(p) and not _job_is_active(_upload_job_id(name)):
+    with _thumbnail_upload_cleanup() as idle:
+        if not idle:
+            return
+        cap = UPLOADS_MAX_GB * 1024 ** 3
+        if cap <= 0:
+            return
+        used = _dir_size(UPLOAD_DIR)
+        if used <= cap:
+            return
+        files = []
+        for name in os.listdir(UPLOAD_DIR):
+            p = os.path.join(UPLOAD_DIR, name)
+            if (os.path.isfile(p) and not legacy_upload_session_id(name)
+                    and not _job_is_active(_upload_job_id(name))):
+                try:
+                    files.append((os.path.getmtime(p), p, os.path.getsize(p)))
+                except OSError:
+                    pass
+        files.sort()
+        print(f"🧹 Uploads at {used / 1024**3:.1f} GB (cap {UPLOADS_MAX_GB} GB) — trimming.")
+        for _mtime, path, size in files:
+            if used <= cap:
+                break
             try:
-                files.append((os.path.getmtime(p), p, os.path.getsize(p)))
+                os.remove(path)
+                used -= size
+                print(f"🧹 Size cap: removed upload {os.path.basename(path)}")
             except OSError:
                 pass
-    files.sort()
-    print(f"🧹 Uploads at {used / 1024**3:.1f} GB (cap {UPLOADS_MAX_GB} GB) — trimming.")
-    for _mtime, path, size in files:
-        if used <= cap:
-            break
-        try:
-            os.remove(path)
-            used -= size
-            print(f"🧹 Size cap: removed upload {os.path.basename(path)}")
-        except OSError:
-            pass
 
 
 def _enforce_output_size_cap():
@@ -1972,6 +1999,7 @@ async def cleanup_jobs():
             # Simple directory cleanup based on modification time
             # Check OUTPUT_DIR
             _sweep_expired_job_dirs(now)
+            _sweep_thumbnail_sessions(now)
 
             for job_id in _sweep_retained_sources(now):
                 print(f"🧹 Dropped retained source for job {job_id}")
@@ -2109,7 +2137,12 @@ async def run_job_wrapper(job_id):
     started = time.monotonic()
     try:
         if job:
-            await run_job(job_id, job)
+            try:
+                async with resource_slot(RENDER_RESOURCE_LOCK, RENDER_RESOURCE_WAIT_SECONDS, "clip-job"):
+                    await run_job(job_id, job)
+            except (ResourceWaitTimeout, OSError) as exc:
+                job['status'] = 'failed'
+                job.setdefault('logs', []).append(f"Local render resource unavailable: {exc}")
             if job.get('status') == 'completed':
                 _record_job_duration(time.monotonic() - started)
     except asyncio.CancelledError:
@@ -2932,6 +2965,7 @@ app.mount("/videos", RestoringStaticFiles(
 
 # Mount static files for serving thumbnails
 THUMBNAILS_DIR = os.path.join(OUTPUT_DIR, "thumbnails")
+THUMBNAIL_LEASE_DIR = os.environ.get("THUMBNAIL_LEASE_DIR", ".cache/thumbnail-leases")
 os.makedirs(THUMBNAILS_DIR, exist_ok=True)
 # Same allowlist as /videos: images only, never a session's scratch files.
 app.mount("/thumbnails", RestoringStaticFiles(
@@ -3284,6 +3318,39 @@ async def health_ready():
     if _stopping:
         return JSONResponse({"status": "stopping"}, status_code=503)
     return {"status": "ready"}
+
+@app.get("/api/operations")
+async def local_operations():
+    """Self-host health without credentials or local file paths."""
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        slot = resource_status(RENDER_RESOURCE_LOCK)
+    except OSError:
+        slot = {"enabled": bool(RENDER_RESOURCE_LOCK), "busy": None, "error": "Resource lock storage unavailable"}
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.get(f"{RENDER_SERVICE_URL}/health")
+            renderer_state = response.json()
+            renderer_ready = response.status_code == 200 and renderer_state.get("ok") is True
+    except Exception:
+        renderer_state = {}
+        renderer_ready = False
+    statuses = [job.get("status") for job in jobs.values()]
+    return {
+        "profile": os.environ.get("LOCAL_RESOURCE_PROFILE", "custom"),
+        "limits": {"jobs": MAX_CONCURRENT_JOBS,
+                   "clip_workers": int(os.environ.get("CLIP_WORKERS", "6")),
+                   "ffmpeg_threads": int(os.environ.get("FFMPEG_THREADS", "0")),
+                   "resource_wait_seconds": RENDER_RESOURCE_WAIT_SECONDS},
+        "queue": {"queued": statuses.count("queued"), "processing": statuses.count("processing"),
+                  "render_queued": renderer_state.get("queued"),
+                  "render_active": renderer_state.get("rendering")},
+        "resource": slot,
+        "renderer": "ready" if renderer_ready else "unavailable",
+        "stopping": _stopping,
+    }
+
 
 @app.get("/api/config")
 async def get_config():
@@ -3700,6 +3767,7 @@ async def process_endpoint(
     # generation without re-uploading or re-transcribing.
     thumb_session = None
     if thumbnail_session_id and not url and not file:
+        _check_thumbnail_session_id(thumbnail_session_id)
         thumb_session = thumbnail_sessions.get(thumbnail_session_id)
         if not thumb_session:
             raise HTTPException(status_code=404, detail="Thumbnail session not found or expired")
@@ -3844,16 +3912,21 @@ async def process_endpoint(
         # Hardlink (or copy) the session's video under the job's name so source
         # lookup, the clip editor and the preview treat it exactly like a normal
         # upload; the transcript rides along so the pipeline skips Whisper.
-        src = thumb_session["video_path"]
-        src_duration = _media_duration_seconds(src)
-        if MIN_SOURCE_SECONDS > 0 and 0 < src_duration < MIN_SOURCE_SECONDS:
-            shutil.rmtree(job_output_dir, ignore_errors=True)
-            _reject_short_source(src_duration)
-        input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{os.path.basename(src)}")
-        try:
-            os.link(src, input_path)
-        except OSError:
-            shutil.copyfile(src, input_path)
+        with _thumbnail_lease(thumbnail_session_id):
+            await _ensure_thumbnail_session_owner(request, thumbnail_session_id)
+            src = thumb_session["video_path"]
+            if not os.path.isfile(src):
+                shutil.rmtree(job_output_dir, ignore_errors=True)
+                raise HTTPException(status_code=404, detail="Thumbnail source has expired; upload it again")
+            src_duration = _media_duration_seconds(src)
+            if MIN_SOURCE_SECONDS > 0 and 0 < src_duration < MIN_SOURCE_SECONDS:
+                shutil.rmtree(job_output_dir, ignore_errors=True)
+                _reject_short_source(src_duration)
+            input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{os.path.basename(src)}")
+            try:
+                os.link(src, input_path)
+            except OSError:
+                shutil.copyfile(src, input_path)
         cmd.extend(["-i", input_path])
         # An empty transcript (e.g. a silent or music-only source) is not worth
         # forwarding: main.py would reject it and retranscribe anyway.
@@ -5435,7 +5508,6 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
 RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://renderer:3100")
 # render id -> owner user id (None for self-host / BYOK), for the status poll.
 _render_owners: Dict[str, Optional[str]] = {}
-
 RENDER_MAX_FRAMES = int(os.getenv("RENDER_MAX_FRAMES", str(60 * 60 * 5)))  # 5 min at 60 fps
 RENDER_MAX_SIDE = int(os.getenv("RENDER_MAX_SIDE", "2160"))
 
@@ -6921,12 +6993,14 @@ async def _download_thumbnail_source(url, session_id, paid_allowed=True, cap_min
     """Download a Thumbnail Studio link in a worker thread (never on the event
     loop) and record any per-GB proxy bytes in the ledger, like a job does."""
     from main import download_youtube_video
+    _check_thumbnail_session_id(session_id)
+    upload_dir = os.path.join(UPLOAD_DIR, f"thumb_{session_id}")
+    os.makedirs(upload_dir, exist_ok=True)
     route = {}
-    loop = asyncio.get_event_loop()
     try:
-        vpath, _ = await loop.run_in_executor(None, functools.partial(
-            download_youtube_video, url, UPLOAD_DIR, allow_paid=paid_allowed,
-            cap_minutes=cap_minutes, route_out=route))
+        vpath, _ = await _thumbnail_in_executor(session_id,
+            download_youtube_video, url, upload_dir, allow_paid=paid_allowed,
+            cap_minutes=cap_minutes, route_out=route)
     finally:
         if BILLING_ENABLED and route:
             try:
@@ -6938,7 +7012,7 @@ async def _download_thumbnail_source(url, session_id, paid_allowed=True, cap_min
         # The download is a second request: a server may answer it with more
         # than the probe saw. Transcribe only what was paid for.
         try:
-            got = await loop.run_in_executor(None, _metering.probe_file_minutes, vpath)
+            got = await _thumbnail_in_executor(session_id, _metering.probe_file_minutes, vpath)
         except Exception:
             got = 0.0
         if got > float(cap_minutes) + 5:
@@ -6957,7 +7031,10 @@ async def _save_thumbnail_upload(file, session_id):
     # basename() stops a "../../x" filename from escaping UPLOAD_DIR; the
     # chunked read caps memory so a huge body can't OOM.
     safe_name = os.path.basename(file.filename or "upload") or "upload"
-    video_path = os.path.join(UPLOAD_DIR, f"thumb_{session_id}_{safe_name}")
+    _check_thumbnail_session_id(session_id)
+    upload_dir = os.path.join(UPLOAD_DIR, f"thumb_{session_id}")
+    os.makedirs(upload_dir, exist_ok=True)
+    video_path = os.path.join(upload_dir, f"source_{safe_name}")
     size = 0
     limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
     with open(video_path, "wb") as buffer:
@@ -6971,8 +7048,8 @@ async def _save_thumbnail_upload(file, session_id):
     if not BILLING_ENABLED:
         return video_path, None
     try:
-        minutes = await asyncio.get_event_loop().run_in_executor(
-            None, _metering.probe_file_minutes, video_path)
+        minutes = await _thumbnail_in_executor(
+            session_id, _metering.probe_file_minutes, video_path)
     except Exception:
         _remove_quietly(video_path)
         raise HTTPException(status_code=400, detail="The upload is not a readable video file.")
@@ -7005,91 +7082,92 @@ async def thumbnail_upload(
         raise HTTPException(status_code=400, detail="Must provide URL or File")
 
     session_id = str(uuid.uuid4())
-    transcript_event = asyncio.Event()
+    with _thumbnail_lease(session_id):
+        await _ensure_thumbnail_session_owner(request, session_id)
+        transcript_event = asyncio.Event()
 
-    # Everything is checked and reserved BEFORE the background download or
-    # Whisper start: the URL, the source length and the balance.
-    video_path = None
-    source_minutes = None
-    paid_allowed = True
-    if file:
-        url = None
-        video_path, source_minutes = await _save_thumbnail_upload(file, session_id)
-    else:
-        source_minutes, paid_allowed = await _probe_thumbnail_url(request, url, user)
+        # Everything is checked and reserved BEFORE the background download or
+        # Whisper start: the URL, the source length and the balance.
+        video_path = None
+        source_minutes = None
+        paid_allowed = True
+        if file:
+            url = None
+            video_path, source_minutes = await _save_thumbnail_upload(file, session_id)
+        else:
+            source_minutes, paid_allowed = await _probe_thumbnail_url(request, url, user)
 
-    # Meter the background download + Whisper transcription by the source's
-    # length so an entitled user can't loop it for free. Settled when the job
-    # finishes.
-    transcribe_minutes = thumbnail_transcribe_minutes(source_minutes) if BILLING_ENABLED else 0
-    try:
-        reservation_id = await reserve_managed_action(
-            request, transcribe_minutes, session_id, "thumbnail_transcribe")
-    except BaseException:
-        _remove_quietly(video_path)
-        raise
-
-    # Initialize session
-    _thumb_owner = await _owner_id(request)
-    _write_owner_marker(os.path.join(THUMBNAILS_DIR, session_id), _thumb_owner)
-    thumbnail_sessions[session_id] = {
-        "user_id": _thumb_owner,
-        "video_path": video_path,
-        "transcript_event": transcript_event,
-        "transcript_ready": False,
-        "transcript": None,
-        "transcript_segments": [],
-        "video_duration": 0,
-        "language": "en",
-        "context": "",
-        "titles": [],
-        "conversation": [],
-        "_url": url,  # Store URL for deferred download
-    }
-
-    async def run_background_whisper():
+        # Meter the background download + Whisper transcription by the source's
+        # length so an entitled user can't loop it for free. Settled when the job
+        # finishes.
+        transcribe_minutes = thumbnail_transcribe_minutes(source_minutes) if BILLING_ENABLED else 0
         try:
-            vpath = video_path
-            # Download the video if a URL was provided
-            if not vpath and url:
-                vpath = await _download_thumbnail_source(
-                    url, session_id, paid_allowed=paid_allowed, cap_minutes=source_minutes)
-                thumbnail_sessions[session_id]["video_path"] = vpath
+            reservation_id = await reserve_managed_action(
+                request, transcribe_minutes, session_id, "thumbnail_transcribe")
+        except BaseException:
+            _remove_quietly(video_path)
+            raise
 
-            from main import transcribe_video
-            loop = asyncio.get_event_loop()
+        # Initialize session
+        _thumb_owner = await _owner_id(request)
+        thumbnail_sessions[session_id] = {
+            "user_id": _thumb_owner,
+            "video_path": video_path,
+            "transcript_event": transcript_event,
+            "transcript_ready": False,
+            "transcript": None,
+            "transcript_segments": [],
+            "video_duration": 0,
+            "language": "en",
+            "context": "",
+            "titles": [],
+            "conversation": [],
+            "_url": url,  # Store URL for deferred download
+        }
+
+        async def run_background_whisper():
             try:
-                transcript = await loop.run_in_executor(None, transcribe_video, vpath)
+                vpath = video_path
+                # Download the video if a URL was provided
+                if not vpath and url:
+                    vpath = await _download_thumbnail_source(
+                        url, session_id, paid_allowed=paid_allowed, cap_minutes=source_minutes)
+                    thumbnail_sessions[session_id]["video_path"] = vpath
+
+                from main import transcribe_video
+                loop = asyncio.get_event_loop()
+                try:
+                    transcript = await _thumbnail_in_executor(session_id, transcribe_video, vpath)
+                finally:
+                    # See transcribe_backends.release_models: the API process is
+                    # long-lived and the GPU is shared with every running job.
+                    import transcribe_backends
+                    await loop.run_in_executor(None, transcribe_backends.release_models)
+                segments = transcript.get("segments", [])
+                duration = segments[-1]["end"] if segments else 0
+
+                thumbnail_sessions[session_id].update({
+                    "transcript_ready": True,
+                    "transcript": transcript,
+                    "transcript_segments": segments,
+                    "video_duration": duration,
+                    "language": transcript.get("language", "en"),
+                    "metered": True,  # the transcription was paid for
+                })
+                print(f"✅ [Thumbnail] Background Whisper complete for session {session_id}")
+                if reservation_id:
+                    await _metering.commit_reservation(reservation_id)
+            except Exception as e:
+                print(f"❌ [Thumbnail] Background Whisper failed: {e}")
+                thumbnail_sessions[session_id]["transcript_error"] = str(e)
+                if reservation_id:
+                    await _metering.release_reservation(reservation_id)
             finally:
-                # See transcribe_backends.release_models: the API process is
-                # long-lived and the GPU is shared with every running job.
-                import transcribe_backends
-                await loop.run_in_executor(None, transcribe_backends.release_models)
-            segments = transcript.get("segments", [])
-            duration = segments[-1]["end"] if segments else 0
+                transcript_event.set()
 
-            thumbnail_sessions[session_id].update({
-                "transcript_ready": True,
-                "transcript": transcript,
-                "transcript_segments": segments,
-                "video_duration": duration,
-                "language": transcript.get("language", "en"),
-                "metered": True,  # the transcription was paid for
-            })
-            print(f"✅ [Thumbnail] Background Whisper complete for session {session_id}")
-            if reservation_id:
-                await _metering.commit_reservation(reservation_id)
-        except Exception as e:
-            print(f"❌ [Thumbnail] Background Whisper failed: {e}")
-            thumbnail_sessions[session_id]["transcript_error"] = str(e)
-            if reservation_id:
-                await _metering.release_reservation(reservation_id)
-        finally:
-            transcript_event.set()
+        _thumbnail_background_task(session_id, run_background_whisper())
 
-    asyncio.create_task(run_background_whisper())
-
-    return {"session_id": session_id}
+        return {"session_id": session_id}
 
 
 @app.post("/api/thumbnail/analyze")
@@ -7101,108 +7179,112 @@ async def thumbnail_analyze(
     x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key")
 ):
     """Analyze a video and suggest viral YouTube titles."""
+    if session_id is not None:
+        _check_thumbnail_session_id(session_id)
     api_key = await resolve_gemini(request)
     if not api_key:
         raise gemini_missing_error()
 
-    pre_transcript = None
-    url = (url or "").strip() or None
-    # Managed Gemini analysis (no-op for self-host); a source analysed here
-    # directly also pays for its transcription, as /upload would have.
-    analyze_minutes = _cloud_config.MANAGED_ANALYSIS_MINUTES if BILLING_ENABLED else 0
-    download_url = None
-    paid_allowed = True
-    source_minutes = None
-    video_path = None
-
-    # Check for pre-existing session with background Whisper
-    if session_id and session_id in thumbnail_sessions:
-        session = thumbnail_sessions[session_id]
-        await _assert_job_owner(request, session)
-
-        # Wait for background Whisper to complete
-        transcript_event = session.get("transcript_event")
-        if transcript_event:
-            print(f"⏳ [Thumbnail] Waiting for background Whisper to finish...")
-            await transcript_event.wait()
-
-        if session.get("transcript_error"):
-            raise HTTPException(status_code=500, detail=f"Transcription failed: {session['transcript_error']}")
-
-        video_path = session["video_path"]
-        if not video_path or not os.path.exists(video_path):
-            raise HTTPException(status_code=404, detail="Video file not found in session")
-
-        if session.get("transcript_ready"):
-            pre_transcript = session["transcript"]
-    else:
-        # No pre-existing session — need file or URL
-        if not url and not file:
-            raise HTTPException(status_code=400, detail="Must provide URL, File, or session_id")
-
+    if not session_id or session_id not in thumbnail_sessions:
         session_id = str(uuid.uuid4())
+    with _thumbnail_lease(session_id):
+        pre_transcript = None
+        url = (url or "").strip() or None
+        # Managed Gemini analysis (no-op for self-host); a source analysed here
+        # directly also pays for its transcription, as /upload would have.
+        analyze_minutes = _cloud_config.MANAGED_ANALYSIS_MINUTES if BILLING_ENABLED else 0
+        download_url = None
+        paid_allowed = True
+        source_minutes = None
+        video_path = None
 
-        if file:
-            video_path, source_minutes = await _save_thumbnail_upload(file, session_id)
+        # Check for pre-existing session with background Whisper
+        if session_id and session_id in thumbnail_sessions:
+            session = thumbnail_sessions[session_id]
+            await _assert_job_owner(request, session)
+            await _ensure_thumbnail_session_owner(request, session_id)
+
+            # Wait for background Whisper to complete
+            transcript_event = session.get("transcript_event")
+            if transcript_event:
+                print(f"⏳ [Thumbnail] Waiting for background Whisper to finish...")
+                await transcript_event.wait()
+
+            if session.get("transcript_error"):
+                raise HTTPException(status_code=500, detail=f"Transcription failed: {session['transcript_error']}")
+
+            video_path = session["video_path"]
+            if not video_path or not os.path.exists(video_path):
+                raise HTTPException(status_code=404, detail="Video file not found in session")
+
+            if session.get("transcript_ready"):
+                pre_transcript = session["transcript"]
         else:
-            user = await _user_from_request(request) if BILLING_ENABLED else None
-            source_minutes, paid_allowed = await _probe_thumbnail_url(request, url, user)
-            download_url = url
-        if BILLING_ENABLED:
-            analyze_minutes += thumbnail_transcribe_minutes(source_minutes)
+            # No pre-existing session — need file or URL
+            if not url and not file:
+                raise HTTPException(status_code=400, detail="Must provide URL, File, or session_id")
 
-    try:
-        reservation_id = await reserve_managed_action(request, analyze_minutes, session_id, "thumbnail_analyze")
-    except BaseException:
-        if not pre_transcript and video_path and session_id not in thumbnail_sessions:
-            _remove_quietly(video_path)
-        raise
+            await _ensure_thumbnail_session_owner(request, session_id)
 
-    try:
-        if download_url:
-            video_path = await _download_thumbnail_source(
-                download_url, session_id, paid_allowed=paid_allowed, cap_minutes=source_minutes)
+            if file:
+                video_path, source_minutes = await _save_thumbnail_upload(file, session_id)
+            else:
+                user = await _user_from_request(request) if BILLING_ENABLED else None
+                source_minutes, paid_allowed = await _probe_thumbnail_url(request, url, user)
+                download_url = url
+            if BILLING_ENABLED:
+                analyze_minutes += thumbnail_transcribe_minutes(source_minutes)
 
-        # Run analysis in thread pool (skips Whisper if pre_transcript is available)
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, analyze_video_for_titles, api_key, video_path, pre_transcript)
+        try:
+            reservation_id = await reserve_managed_action(request, analyze_minutes, session_id, "thumbnail_analyze")
+        except BaseException:
+            if not pre_transcript and video_path and session_id not in thumbnail_sessions:
+                _remove_quietly(video_path)
+            raise
 
-        # Store/update session context
-        if session_id not in thumbnail_sessions:
-            thumbnail_sessions[session_id] = {"user_id": await _owner_id(request)}
-            _write_owner_marker(os.path.join(THUMBNAILS_DIR, session_id),
-                                thumbnail_sessions[session_id]["user_id"])
+        try:
+            if download_url:
+                video_path = await _download_thumbnail_source(
+                    download_url, session_id, paid_allowed=paid_allowed, cap_minutes=source_minutes)
 
-        thumbnail_sessions[session_id].update({
-            "context": result.get("transcript_summary", ""),
-            "titles": result.get("titles", []),
-            "thumbnail_texts": result.get("thumbnail_texts", []),
-            "language": result.get("language", "en"),
-            "conversation": thumbnail_sessions[session_id].get("conversation", []),
-            "video_path": video_path,
-            "transcript_segments": result.get("segments", []),
-            "video_duration": result.get("video_duration", 0),
-            # A metered analysis ran on this session: its follow-up text calls
-            # (refine, describe) are part of what was paid for.
-            "metered": True,
-        })
+            # Run analysis in thread pool (skips Whisper if pre_transcript is available)
+            loop = asyncio.get_event_loop()
+            result = await _thumbnail_in_executor(session_id, analyze_video_for_titles, api_key, video_path, pre_transcript)
 
-        if reservation_id:
-            await _metering.commit_reservation(reservation_id)
-        return {
-            "session_id": session_id,
-            "titles": result.get("titles", []),
-            "thumbnail_texts": result.get("thumbnail_texts", []),
-            "context": result.get("transcript_summary", ""),
-            "language": result.get("language", "en"),
-            "recommended": result.get("recommended", [])
-        }
+            # Store/update session context
+            if session_id not in thumbnail_sessions:
+                thumbnail_sessions[session_id] = {"user_id": await _owner_id(request)}
 
-    except Exception as e:
-        if reservation_id:
-            await _metering.release_reservation(reservation_id)
-        print(f"❌ Thumbnail Analyze Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+            thumbnail_sessions[session_id].update({
+                "context": result.get("transcript_summary", ""),
+                "titles": result.get("titles", []),
+                "thumbnail_texts": result.get("thumbnail_texts", []),
+                "language": result.get("language", "en"),
+                "conversation": thumbnail_sessions[session_id].get("conversation", []),
+                "video_path": video_path,
+                "transcript_segments": result.get("segments", []),
+                "video_duration": result.get("video_duration", 0),
+                # A metered analysis ran on this session: its follow-up text calls
+                # (refine, describe) are part of what was paid for.
+                "metered": True,
+            })
+
+            if reservation_id:
+                await _metering.commit_reservation(reservation_id)
+            return {
+                "session_id": session_id,
+                "titles": result.get("titles", []),
+                "thumbnail_texts": result.get("thumbnail_texts", []),
+                "context": result.get("transcript_summary", ""),
+                "language": result.get("language", "en"),
+                "recommended": result.get("recommended", [])
+            }
+
+        except Exception as e:
+            if reservation_id:
+                await _metering.release_reservation(reservation_id)
+            print(f"❌ Thumbnail Analyze Error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 def _cloud_cfg():
@@ -7249,6 +7331,126 @@ async def _thumbnail_text_gate(request, session):
     times.append(now)
 
 
+@contextmanager
+def _thumbnail_lease(session_id):
+    """Protect media across API processes; never block the async event loop."""
+    _check_thumbnail_session_id(session_id)
+    lease = ExitStack()
+    try:
+        lease.enter_context(session_lease(os.path.join(THUMBNAIL_LEASE_DIR, ".uploads"), "cleanup"))
+        lease.enter_context(session_lease(THUMBNAIL_LEASE_DIR, session_id))
+    except SessionBusy:
+        lease.close()
+        raise HTTPException(status_code=409, detail="Thumbnail session is being cleaned; retry") from None
+    except OSError:
+        lease.close()
+        raise HTTPException(status_code=503, detail="Thumbnail activity storage unavailable") from None
+    try:
+        yield
+    finally:
+        lease.__exit__(None, None, None)
+
+
+_thumbnail_background_tasks: set = set()
+
+
+def _thumbnail_background_task(session_id, coroutine):
+    lease = ExitStack()
+    try:
+        lease.enter_context(_thumbnail_lease(session_id))
+        task = asyncio.create_task(coroutine)
+    except BaseException:
+        lease.close()
+        coroutine.close()
+        raise
+    _thumbnail_background_tasks.add(task)
+    task.add_done_callback(_thumbnail_background_tasks.discard)
+    task.add_done_callback(lambda done: lease.close())
+    return task
+
+
+async def _thumbnail_in_executor(session_id, function, *args, **kwargs):
+    """A cancelled HTTP caller must not unpin a thread still using its files."""
+    lease = _thumbnail_lease(session_id)
+    lease.__enter__()
+
+    def run():
+        try:
+            return function(*args, **kwargs)
+        finally:
+            lease.__exit__(None, None, None)
+
+    try:
+        future = asyncio.get_running_loop().run_in_executor(None, run)
+    except BaseException:
+        lease.__exit__(None, None, None)
+        raise
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        # The thread owns the lease until its finally. Retrieve any late error.
+        future.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        raise
+
+
+def _sweep_thumbnail_sessions(now):
+    removed = cleanup_sessions(
+        THUMBNAILS_DIR, UPLOAD_DIR, THUMBNAIL_LEASE_DIR,
+        JOB_RETENTION_SECONDS, OUTPUT_MAX_GB * 1024 ** 3, UPLOADS_MAX_GB * 1024 ** 3,
+        now=now, output_used_bytes=_dir_size(OUTPUT_DIR), upload_used_bytes=_dir_size(UPLOAD_DIR))
+    for session_id in removed:
+        thumbnail_sessions.pop(session_id, None)
+        print(f"🧹 Purged thumbnail session: {session_id}")
+    return removed
+
+
+def _check_thumbnail_session_id(value):
+    from security_utils import validate_thumbnail_session_id
+    try:
+        return validate_thumbnail_session_id(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+
+async def _ensure_thumbnail_session_owner(request, session_id):
+    """Claim a new cloud thumbnail directory without replacing another owner.
+
+    The in-memory session map can be empty after restart or on a second API
+    instance; the existing disk marker remains authoritative in that case.
+    """
+    _check_thumbnail_session_id(session_id)
+    if not BILLING_ENABLED:
+        return
+    owner = await _owner_id(request)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    raw_directory = os.path.join(THUMBNAILS_DIR, session_id)
+    directory = _safe_under(THUMBNAILS_DIR, session_id)
+    if not directory or os.path.islink(THUMBNAILS_DIR) or os.path.islink(raw_directory):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    def check_existing():
+        marker = os.path.join(directory, ".owner")
+        if not os.path.isdir(directory) or os.path.islink(marker) or _read_owner_marker(directory) != str(owner):
+            raise HTTPException(status_code=404, detail="Session not found")
+
+    try:
+        os.mkdir(directory)
+    except FileExistsError:
+        check_existing()
+        return
+    except OSError:
+        raise HTTPException(status_code=503, detail="Thumbnail ownership storage unavailable") from None
+    try:
+        fd = os.open(os.path.join(directory, ".owner"), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w") as marker:
+            marker.write(str(owner))
+    except FileExistsError:
+        check_existing()
+    except OSError:
+        raise HTTPException(status_code=503, detail="Thumbnail ownership storage unavailable") from None
+
+
 class ThumbnailTitlesRequest(BaseModel):
     session_id: Optional[str] = None
     message: Optional[str] = None
@@ -7260,78 +7462,83 @@ async def thumbnail_titles(
     request: Request,
 ):
     """Refine title suggestions or accept a manual title."""
-    api_key = await resolve_gemini(request)
-    if not api_key:
-        raise gemini_missing_error()
-    _check_text_length(req.title, _cloud_cfg().THUMBNAIL_TITLE_MAX_CHARS, "title")
-    _check_text_length(req.message, _cloud_cfg().THUMBNAIL_MESSAGE_MAX_CHARS, "message")
+    if req.session_id is not None:
+        _check_thumbnail_session_id(req.session_id)
+    session_id = req.session_id or str(uuid.uuid4())
+    with _thumbnail_lease(session_id):
+        api_key = await resolve_gemini(request)
+        if not api_key:
+            raise gemini_missing_error()
+        _check_text_length(req.title, _cloud_cfg().THUMBNAIL_TITLE_MAX_CHARS, "title")
+        _check_text_length(req.message, _cloud_cfg().THUMBNAIL_MESSAGE_MAX_CHARS, "message")
 
-    # Manual title mode - just create a session with the user's title
-    if req.title:
-        session_id = req.session_id or str(uuid.uuid4())
-        if session_id not in thumbnail_sessions:
-            thumbnail_sessions[session_id] = {
-                "user_id": await _owner_id(request),
-                "context": "",
-                "titles": [req.title],
-                "language": "en",
-                "conversation": []
-            }
-            _write_owner_marker(os.path.join(THUMBNAILS_DIR, session_id),
-                                thumbnail_sessions[session_id]["user_id"])
-        else:
-            await _assert_job_owner(request, thumbnail_sessions[session_id])
-        return {"session_id": session_id, "titles": [req.title]}
+        # Manual title mode - just create a session with the user's title
+        if req.title:
+            if session_id in thumbnail_sessions:
+                await _assert_job_owner(request, thumbnail_sessions[session_id])
+            await _ensure_thumbnail_session_owner(request, session_id)
+            if session_id not in thumbnail_sessions:
+                thumbnail_sessions[session_id] = {
+                    "user_id": await _owner_id(request),
+                    "context": "",
+                    "titles": [req.title],
+                    "language": "en",
+                    "conversation": []
+                }
+            else:
+                await _assert_job_owner(request, thumbnail_sessions[session_id])
+            return {"session_id": session_id, "titles": [req.title]}
 
-    # Refinement mode
-    if not req.session_id or req.session_id not in thumbnail_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
+        # Refinement mode
+        if not req.session_id or req.session_id not in thumbnail_sessions:
+            raise HTTPException(status_code=404, detail="Session not found")
 
-    if not req.message:
-        raise HTTPException(status_code=400, detail="Must provide message or title")
+        if not req.message:
+            raise HTTPException(status_code=400, detail="Must provide message or title")
 
-    session = thumbnail_sessions[req.session_id]
-    await _assert_job_owner(request, session)
-    await _thumbnail_text_gate(request, session)
-    refines = int(session.get("refines", 0))
-    if refines >= _cloud_cfg().THUMBNAIL_REFINES_PER_SESSION:
-        raise HTTPException(status_code=429, detail=(
-            f"This video has had {refines} title refinements, the most per analysis. "
-            "Analyze the video again to keep refining."))
-    session["refines"] = refines + 1
+        session = thumbnail_sessions[req.session_id]
+        await _assert_job_owner(request, session)
+        await _ensure_thumbnail_session_owner(request, req.session_id)
+        await _thumbnail_text_gate(request, session)
+        refines = int(session.get("refines", 0))
+        if refines >= _cloud_cfg().THUMBNAIL_REFINES_PER_SESSION:
+            raise HTTPException(status_code=429, detail=(
+                f"This video has had {refines} title refinements, the most per analysis. "
+                "Analyze the video again to keep refining."))
+        session["refines"] = refines + 1
 
-    # Add user message to conversation history; only the latest turns go back
-    # to the model, so the prompt stays bounded however long the chat runs.
-    session["conversation"].append({"role": "user", "content": req.message})
-    del session["conversation"][:-_cloud_cfg().THUMBNAIL_CONVERSATION_MAX_TURNS]
-
-    try:
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            refine_titles,
-            api_key,
-            session["context"],
-            req.message,
-            session["conversation"]
-        )
-
-        new_titles = result.get("titles", [])
-        session["titles"] = new_titles
-        session["thumbnail_texts"] = result.get("thumbnail_texts", [])
-        # The user may have asked for another language ("in English"): the
-        # thumbnail text must follow the titles, not the transcript.
-        if result.get("language"):
-            session["language"] = result["language"]
-        session["conversation"].append({"role": "assistant", "content": json.dumps(new_titles)})
+        # Add user message to conversation history; only the latest turns go back
+        # to the model, so the prompt stays bounded however long the chat runs.
+        session["conversation"].append({"role": "user", "content": req.message})
         del session["conversation"][:-_cloud_cfg().THUMBNAIL_CONVERSATION_MAX_TURNS]
 
-        return {"titles": new_titles, "thumbnail_texts": session["thumbnail_texts"],
-                "language": session["language"]}
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                refine_titles,
+                api_key,
+                session["context"],
+                req.message,
+                session["conversation"]
+            )
 
-    except Exception as e:
-        print(f"❌ Thumbnail Titles Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+            new_titles = result.get("titles", [])
+            session["titles"] = new_titles
+            session["thumbnail_texts"] = result.get("thumbnail_texts", [])
+            # The user may have asked for another language ("in English"): the
+            # thumbnail text must follow the titles, not the transcript.
+            if result.get("language"):
+                session["language"] = result["language"]
+            session["conversation"].append({"role": "assistant", "content": json.dumps(new_titles)})
+            del session["conversation"][:-_cloud_cfg().THUMBNAIL_CONVERSATION_MAX_TURNS]
+
+            return {"titles": new_titles, "thumbnail_texts": session["thumbnail_texts"],
+                    "language": session["language"]}
+
+        except Exception as e:
+            print(f"❌ Thumbnail Titles Error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/thumbnail/generate")
@@ -7353,127 +7560,133 @@ async def thumbnail_generate(
     text itself, which is prettier when it works and misspelled when it does
     not. frame: url of a frame from /api/thumbnail/frames to use as the
     person reference when no face photo is uploaded."""
-    api_key = await resolve_gemini(request)
-    if not api_key:
-        raise gemini_missing_error()
+    _check_thumbnail_session_id(session_id)
+    with _thumbnail_lease(session_id):
+        api_key = await resolve_gemini(request)
+        if not api_key:
+            raise gemini_missing_error()
 
-    # Image generation is the one expensive managed Gemini call — paid plans only.
-    if BILLING_ENABLED:
-        user = await _user_from_request(request)
-        if user is not None and user.plan == "free":
-            raise HTTPException(status_code=403, detail={
-                "error": "plan_required",
-                "message": "AI thumbnail generation is available on paid plans.",
-            })
-    # The session carries someone's transcript, titles and frames: only its
-    # owner may generate from it (and be billed for it).
-    _sess = thumbnail_sessions.get(session_id)
-    if _sess is not None:
-        await _assert_job_owner(request, _sess)
+        # Image generation is the one expensive managed Gemini call — paid plans only.
+        if BILLING_ENABLED:
+            user = await _user_from_request(request)
+            if user is not None and user.plan == "free":
+                raise HTTPException(status_code=403, detail={
+                    "error": "plan_required",
+                    "message": "AI thumbnail generation is available on paid plans.",
+                })
+        # The session carries someone's transcript, titles and frames: only its
+        # owner may generate from it (and be billed for it).
+        _sess = thumbnail_sessions.get(session_id)
+        if _sess is not None:
+            await _assert_job_owner(request, _sess)
+        await _ensure_thumbnail_session_owner(request, session_id)
 
-    # Clamp count
-    count = min(max(1, count), 6)
+        # Clamp count
+        count = min(max(1, count), 6)
 
-    # Gemini image generation is the expensive managed call — meter it against the
-    # plan quota (a batch ≈ THUMBNAIL_MINUTES). No-op for BYOK / self-host.
-    thumb_minutes = _cloud_config.THUMBNAIL_MINUTES if BILLING_ENABLED else 0
-    reservation_id = await reserve_managed_action(request, thumb_minutes, session_id, "thumbnail")
+        # Gemini image generation is the expensive managed call — meter it against the
+        # plan quota (a batch ≈ THUMBNAIL_MINUTES). No-op for BYOK / self-host.
+        thumb_minutes = _cloud_config.THUMBNAIL_MINUTES if BILLING_ENABLED else 0
+        reservation_id = await reserve_managed_action(request, thumb_minutes, session_id, "thumbnail")
 
-    # Save optional uploaded images. basename() on the session id and filenames
-    # keeps everything inside UPLOAD_DIR (no "../" escape from client input).
-    face_path = None
-    bg_path = None
-    safe_session = os.path.basename(session_id) or "session"
-    thumb_upload_dir = os.path.join(UPLOAD_DIR, f"thumb_{safe_session}")
-    os.makedirs(thumb_upload_dir, exist_ok=True)
+        # Save optional uploaded images. basename() on the session id and filenames
+        # keeps everything inside UPLOAD_DIR (no "../" escape from client input).
+        face_path = None
+        bg_path = None
+        safe_session = os.path.basename(session_id) or "session"
+        thumb_upload_dir = os.path.join(UPLOAD_DIR, f"thumb_{safe_session}")
+        os.makedirs(thumb_upload_dir, exist_ok=True)
 
-    try:
-        if face and face.filename:
-            face_name = os.path.basename(face.filename)
-            face_path = os.path.join(thumb_upload_dir, f"face_{face_name}")
-            with open(face_path, "wb") as f:
-                f.write(await face.read())
+        try:
+            if face and face.filename:
+                face_name = os.path.basename(face.filename)
+                face_path = os.path.join(thumb_upload_dir, f"face_{face_name}")
+                with open(face_path, "wb") as f:
+                    f.write(await face.read())
 
-        if background and background.filename:
-            bg_name = os.path.basename(background.filename)
-            bg_path = os.path.join(thumb_upload_dir, f"bg_{bg_name}")
-            with open(bg_path, "wb") as f:
-                f.write(await background.read())
+            if background and background.filename:
+                bg_name = os.path.basename(background.filename)
+                bg_path = os.path.join(thumb_upload_dir, f"bg_{bg_name}")
+                with open(bg_path, "wb") as f:
+                    f.write(await background.read())
 
-        # Session context: transcript summary, the thumbnail text the critic
-        # paired with this title, the language, and the chosen video frame.
-        video_context, text_hint, language, frame_reference = "", "", "en", None
-        session = thumbnail_sessions.get(session_id)
-        if session:
-            video_context = session.get("context", "")
-            language = session.get("language", "en")
-            titles = session.get("titles", [])
-            texts = session.get("thumbnail_texts", [])
-            if title in titles and titles.index(title) < len(texts):
-                text_hint = texts[titles.index(title)]
-            if frame:
-                frame_reference = next((f for f in session.get("frames", []) if f["url"] == frame), None)
+            # Session context: transcript summary, the thumbnail text the critic
+            # paired with this title, the language, and the chosen video frame.
+            video_context, text_hint, language, frame_reference = "", "", "en", None
+            session = thumbnail_sessions.get(session_id)
+            if session:
+                video_context = session.get("context", "")
+                language = session.get("language", "en")
+                titles = session.get("titles", [])
+                texts = session.get("thumbnail_texts", [])
+                if title in titles and titles.index(title) < len(texts):
+                    text_hint = texts[titles.index(title)]
+                if frame:
+                    frame_reference = next((f for f in session.get("frames", []) if f["url"] == frame), None)
 
-        loop = asyncio.get_event_loop()
-        thumbnails = await loop.run_in_executor(
-            None,
-            functools.partial(
-                generate_thumbnail, api_key, title, session_id, face_path, bg_path,
-                extra_prompt, count, video_context, burn_text=burn_text,
-                thumbnail_text_hint=text_hint, language=language,
-                frame_reference=frame_reference),
-        )
+            loop = asyncio.get_event_loop()
+            thumbnails = await _thumbnail_in_executor(
+                session_id,
+                functools.partial(
+                    generate_thumbnail, api_key, title, session_id, face_path, bg_path,
+                    extra_prompt, count, video_context, burn_text=burn_text,
+                    thumbnail_text_hint=text_hint, language=language,
+                    frame_reference=frame_reference),
+            )
 
-        if not thumbnails:
-            raise HTTPException(status_code=500, detail="Thumbnail generation failed. Please check your Gemini API key has access to image generation (gemini-3.1-flash-image-preview model).")
+            if not thumbnails:
+                raise HTTPException(status_code=500, detail="Thumbnail generation failed. Please check your Gemini API key has access to image generation (gemini-3.1-flash-image-preview model).")
 
-        # Success — charge the reserved minutes.
-        if reservation_id:
-            await _metering.commit_reservation(reservation_id)
-        return {"thumbnails": thumbnails}
+            # Success — charge the reserved minutes.
+            if reservation_id:
+                await _metering.commit_reservation(reservation_id)
+            return {"thumbnails": thumbnails}
 
-    except HTTPException:
-        if reservation_id:
-            await _metering.release_reservation(reservation_id)
-        raise
-    except Exception as e:
-        if reservation_id:
-            await _metering.release_reservation(reservation_id)
-        print(f"❌ Thumbnail Generate Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        except HTTPException:
+            if reservation_id:
+                await _metering.release_reservation(reservation_id)
+            raise
+        except Exception as e:
+            if reservation_id:
+                await _metering.release_reservation(reservation_id)
+            print(f"❌ Thumbnail Generate Error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/thumbnail/frames/{session_id}")
 async def thumbnail_frames(session_id: str, request: Request):
     """Frames of the session's video with a large, sharp face, as candidates
     for the thumbnail's person reference. Computed once and cached."""
-    session = thumbnail_sessions.get(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    await _assert_job_owner(request, session)
-    if "frames" in session:
+    _check_thumbnail_session_id(session_id)
+    with _thumbnail_lease(session_id):
+        session = thumbnail_sessions.get(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        await _assert_job_owner(request, session)
+        await _ensure_thumbnail_session_owner(request, session_id)
+        if "frames" in session:
+            return {"frames": session["frames"]}
+
+        # A URL session downloads in the background before transcribing; the
+        # event fires after both, so waiting on it means the file is on disk.
+        transcript_event = session.get("transcript_event")
+        if transcript_event:
+            await transcript_event.wait()
+        video_path = session.get("video_path")
+        if not video_path or not os.path.exists(video_path):
+            return {"frames": []}
+
+        lock = session.setdefault("_frames_lock", asyncio.Lock())
+        async with lock:
+            if "frames" not in session:
+                loop = asyncio.get_event_loop()
+                try:
+                    frames = await _thumbnail_in_executor(session_id, extract_face_frames, video_path, session_id)
+                except Exception as e:
+                    print(f"❌ [Thumbnail] Frame extraction failed: {e}")
+                    frames = []
+                session["frames"] = frames
         return {"frames": session["frames"]}
-
-    # A URL session downloads in the background before transcribing; the
-    # event fires after both, so waiting on it means the file is on disk.
-    transcript_event = session.get("transcript_event")
-    if transcript_event:
-        await transcript_event.wait()
-    video_path = session.get("video_path")
-    if not video_path or not os.path.exists(video_path):
-        return {"frames": []}
-
-    lock = session.setdefault("_frames_lock", asyncio.Lock())
-    async with lock:
-        if "frames" not in session:
-            loop = asyncio.get_event_loop()
-            try:
-                frames = await loop.run_in_executor(None, extract_face_frames, video_path, session_id)
-            except Exception as e:
-                print(f"❌ [Thumbnail] Frame extraction failed: {e}")
-                frames = []
-            session["frames"] = frames
-    return {"frames": session["frames"]}
 
 
 class ThumbnailDescribeRequest(BaseModel):
@@ -7486,44 +7699,46 @@ async def thumbnail_describe(
     request: Request,
 ):
     """Generate a YouTube description with chapters from the transcript."""
-    api_key = await resolve_gemini(request)
-    if not api_key:
-        raise gemini_missing_error()
+    _check_thumbnail_session_id(req.session_id)
+    with _thumbnail_lease(req.session_id):
+        api_key = await resolve_gemini(request)
+        if not api_key:
+            raise gemini_missing_error()
 
-    _check_text_length(req.title, _cloud_cfg().THUMBNAIL_TITLE_MAX_CHARS, "title")
-    if req.session_id not in thumbnail_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
+        _check_text_length(req.title, _cloud_cfg().THUMBNAIL_TITLE_MAX_CHARS, "title")
+        if req.session_id not in thumbnail_sessions:
+            raise HTTPException(status_code=404, detail="Session not found")
 
-    session = thumbnail_sessions[req.session_id]
-    await _assert_job_owner(request, session)
-    await _thumbnail_text_gate(request, session)
-    segments = session.get("transcript_segments", [])
-    if not segments:
-        raise HTTPException(status_code=400, detail="No transcript segments available. Please analyze a video first.")
+        session = thumbnail_sessions[req.session_id]
+        await _assert_job_owner(request, session)
+        await _ensure_thumbnail_session_owner(request, req.session_id)
+        await _thumbnail_text_gate(request, session)
+        segments = session.get("transcript_segments", [])
+        if not segments:
+            raise HTTPException(status_code=400, detail="No transcript segments available. Please analyze a video first.")
 
-    try:
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            generate_youtube_description,
-            api_key,
-            req.title,
-            segments,
-            session.get("language", "en"),
-            session.get("video_duration", 0),
-            _cloud_cfg().DESCRIBE_TRANSCRIPT_MAX_CHARS,
-        )
-        return {"description": result.get("description", "")}
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                generate_youtube_description,
+                api_key,
+                req.title,
+                segments,
+                session.get("language", "en"),
+                session.get("video_duration", 0),
+                _cloud_cfg().DESCRIBE_TRANSCRIPT_MAX_CHARS,
+            )
+            return {"description": result.get("description", "")}
 
-    except Exception as e:
-        print(f"❌ Thumbnail Describe Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        except Exception as e:
+            print(f"❌ Thumbnail Describe Error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/thumbnail/publish")
 async def thumbnail_publish(
     request: Request,
-    background_tasks: BackgroundTasks,
     session_id: str = Form(...),
     title: str = Form(...),
     description: str = Form(...),
@@ -7532,87 +7747,98 @@ async def thumbnail_publish(
     user_id: Optional[str] = Form(None),   # BYOK profile; ignored for managed users
 ):
     """Kick off a background upload to YouTube via Upload-Post and return immediately."""
-    if session_id not in thumbnail_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
+    _check_thumbnail_session_id(session_id)
+    with _thumbnail_lease(session_id):
+        if session_id not in thumbnail_sessions:
+            raise HTTPException(status_code=404, detail="Session not found")
 
-    # Managed users: server key + forced own profile; body fields ignored.
-    upload_key, forced_profile = await resolve_upload_post(request, api_key)
-    if not upload_key:
-        raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
-    post_user = resolve_post_profile(forced_profile, user_id)
-    await _check_social_post_rate(request)
+        # Managed users: server key + forced own profile; body fields ignored.
+        upload_key, forced_profile = await resolve_upload_post(request, api_key)
+        if not upload_key:
+            raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
+        post_user = resolve_post_profile(forced_profile, user_id)
+        await _check_social_post_rate(request)
 
-    session = thumbnail_sessions[session_id]
-    await _assert_job_owner(request, session)
-    video_path = session.get("video_path")
-    if not video_path or not os.path.exists(video_path):
-        raise HTTPException(status_code=404, detail="Original video file not found")
+        session = thumbnail_sessions[session_id]
+        await _assert_job_owner(request, session)
+        await _ensure_thumbnail_session_owner(request, session_id)
+        video_path = session.get("video_path")
+        if not video_path or not os.path.exists(video_path):
+            raise HTTPException(status_code=404, detail="Original video file not found")
 
-    # Resolve thumbnail path from URL — sanitize against path traversal so a
-    # crafted thumbnail_url (e.g. "thumbnails/../../.env") can't read server
-    # files and exfiltrate them via the Upload-Post multipart body.
-    thumb_relative = thumbnail_url.lstrip("/")
-    if thumb_relative.startswith("thumbnails/"):
-        thumb_path = _safe_under(OUTPUT_DIR, thumb_relative)
-    else:
-        thumb_path = _safe_under(THUMBNAILS_DIR, thumb_relative)
+        # Resolve thumbnail path from URL — sanitize against path traversal so a
+        # crafted thumbnail_url (e.g. "thumbnails/../../.env") can't read server
+        # files and exfiltrate them via the Upload-Post multipart body.
+        thumb_relative = thumbnail_url.lstrip("/")
+        if thumb_relative.startswith("thumbnails/"):
+            thumb_path = _safe_under(OUTPUT_DIR, thumb_relative)
+        else:
+            thumb_path = _safe_under(THUMBNAILS_DIR, thumb_relative)
 
-    if not thumb_path:
-        raise HTTPException(status_code=400, detail="Invalid thumbnail path")
-    if not os.path.exists(thumb_path):
-        raise HTTPException(status_code=404, detail="Thumbnail file not found")
+        session_dir = os.path.realpath(os.path.join(THUMBNAILS_DIR, session_id))
+        if (not thumb_path
+                or os.path.commonpath([session_dir, thumb_path]) != session_dir
+                or os.path.splitext(thumb_path)[1].lower() not in {".jpg", ".jpeg", ".png", ".webp"}):
+            raise HTTPException(status_code=400, detail="Invalid thumbnail path for this session")
+        if not os.path.exists(thumb_path):
+            raise HTTPException(status_code=404, detail="Thumbnail file not found")
 
-    # Generate a unique ID for this publish job so the frontend can poll
-    publish_id = str(uuid.uuid4())
-    publish_jobs[publish_id] = {"status": "uploading", "result": None, "error": None,
-                                "user_id": session.get("user_id")}
+        # Generate a unique ID for this publish job so the frontend can poll
+        publish_id = str(uuid.uuid4())
+        publish_jobs[publish_id] = {"status": "uploading", "result": None, "error": None,
+                                    "user_id": session.get("user_id")}
 
-    def do_upload():
-        """Runs in a thread via BackgroundTasks — does the actual multipart upload."""
-        try:
-            upload_url = "https://api.upload-post.com/api/upload"
-            headers = {"Authorization": f"Apikey {upload_key}"}
-            data_payload = {
-                "user": post_user,
-                "platform[]": ["youtube"],
-                "title": title,          # required base field (fallback)
-                "async_upload": "true",
-                "youtube_title": youtube_title(title),
-                "youtube_description": description,
-                "privacyStatus": "public",
-            }
-            video_filename = os.path.basename(video_path)
-            thumb_filename = os.path.basename(thumb_path)
-
-            print(f"📡 [Thumbnail] Publishing to YouTube via Upload-Post... (publish_id={publish_id})")
-            with open(video_path, "rb") as vf, open(thumb_path, "rb") as tf:
-                files = {
-                    "video": (video_filename, vf.read(), "video/mp4"),
-                    "thumbnail": (thumb_filename, tf.read(), "image/jpeg"),
+        def do_upload():
+            """Runs in a leased worker thread and performs the multipart upload."""
+            try:
+                upload_url = "https://api.upload-post.com/api/upload"
+                headers = {"Authorization": f"Apikey {upload_key}"}
+                data_payload = {
+                    "user": post_user,
+                    "platform[]": ["youtube"],
+                    "title": title,          # required base field (fallback)
+                    "async_upload": "true",
+                    "youtube_title": youtube_title(title),
+                    "youtube_description": description,
+                    "privacyStatus": "public",
                 }
+                video_filename = os.path.basename(video_path)
+                thumb_filename = os.path.basename(thumb_path)
 
-            # Use a long timeout — video uploads can take several minutes
-            with httpx.Client(timeout=600.0) as client:
-                response = client.post(upload_url, headers=headers, data=data_payload, files=files)
+                print(f"📡 [Thumbnail] Publishing to YouTube via Upload-Post... (publish_id={publish_id})")
+                with open(video_path, "rb") as vf, open(thumb_path, "rb") as tf:
+                    files = {
+                        "video": (video_filename, vf.read(), "video/mp4"),
+                        "thumbnail": (thumb_filename, tf.read(), "image/jpeg"),
+                    }
 
-            if response.status_code not in [200, 201, 202]:
-                err = f"Upload-Post API Error ({response.status_code}): {response.text}"
-                print(f"❌ {err}")
+                # Use a long timeout — video uploads can take several minutes
+                with httpx.Client(timeout=600.0) as client:
+                    response = client.post(upload_url, headers=headers, data=data_payload, files=files)
+
+                if response.status_code not in [200, 201, 202]:
+                    err = f"Upload-Post API Error ({response.status_code}): {response.text}"
+                    print(f"❌ {err}")
+                    publish_jobs[publish_id]["status"] = "failed"
+                    publish_jobs[publish_id]["error"] = err
+                else:
+                    print(f"✅ [Thumbnail] Published successfully (publish_id={publish_id})")
+                    publish_jobs[publish_id]["status"] = "done"
+                    publish_jobs[publish_id]["result"] = response.json()
+
+            except Exception as e:
+                err = str(e)
+                print(f"❌ Thumbnail Publish Background Error: {err}")
                 publish_jobs[publish_id]["status"] = "failed"
                 publish_jobs[publish_id]["error"] = err
-            else:
-                print(f"✅ [Thumbnail] Published successfully (publish_id={publish_id})")
-                publish_jobs[publish_id]["status"] = "done"
-                publish_jobs[publish_id]["result"] = response.json()
 
-        except Exception as e:
-            err = str(e)
-            print(f"❌ Thumbnail Publish Background Error: {err}")
-            publish_jobs[publish_id]["status"] = "failed"
-            publish_jobs[publish_id]["error"] = err
+        async def run_upload():
+            await _thumbnail_in_executor(session_id, do_upload)
 
-    background_tasks.add_task(do_upload)
-    return {"publish_id": publish_id, "status": "uploading"}
+        # Schedule before returning: response-send failure must not strand a
+        # held lease in a BackgroundTasks object that will never be run.
+        _thumbnail_background_task(session_id, run_upload())
+        return {"publish_id": publish_id, "status": "uploading"}
 
 
 @app.get("/api/thumbnail/publish/status/{publish_id}")

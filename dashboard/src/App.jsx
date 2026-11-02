@@ -31,9 +31,10 @@ import Modal from './components/ui/Modal';
 import { useAuth } from './contexts/AuthContext';
 import { apiFetch, apiJson, QuotaError, QUOTA_WALL_EVENT } from './lib/api';
 import { track } from './lib/analytics';
+import { forgetBrowserCredentials, persistBrowserCredential } from './lib/browser-credentials';
 
-// Enhanced "Encryption" using XOR + Base64 with a Salt
-// This is better than plain Base64 but still client-side.
+// Reversible obfuscation for browser persistence; this does not protect a
+// key from someone who can access this browser profile.
 const SECRET_KEY = import.meta.env.VITE_ENCRYPTION_KEY || "OpenShorts-Static-Salt-Change-Me";
 const ENCRYPTION_PREFIX = "ENC:";
 
@@ -293,6 +294,8 @@ function App() {
   const [durableClips, setDurableClips] = useState({});
 
   const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || '');
+  const [credentialNotice, setCredentialNotice] = useState('');
+  const credentialGeneration = useRef(0);
   // Social API State - Load encrypted or plain
   const [uploadPostKey, setUploadPostKey] = useState(() => {
     const stored = localStorage.getItem('uploadPostKey_v3');
@@ -736,31 +739,37 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, status, results, activeTab, noSource, projectState]);
 
+  const handleForgetCredentials = () => {
+    credentialGeneration.current += 1;
+    const result = forgetBrowserCredentials(localStorage);
+    setApiKey('');
+    setUploadPostKey('');
+    setElevenLabsKey('');
+    setFalKey('');
+    setUploadUserId('');
+    setUserProfiles([]);
+    setElevenLabsSaved(false);
+    setFalSaved(false);
+    setCredentialNotice(result.cleared
+      ? 'Saved keys and the selected publishing profile were removed from this browser.'
+      : 'Keys were cleared from this page, but browser storage refused deletion. Clear site data before leaving this device.');
+  };
+
   useEffect(() => {
-    // Encrypt Gemini Key too for consistency if desired, but user asked specifically about Social integration not saving well.
-    // For now keeping gemini plain for compatibility unless requested.
-    if (apiKey) localStorage.setItem('gemini_key', apiKey);
+    persistBrowserCredential(localStorage, 'gemini_key', apiKey);
   }, [apiKey]);
 
   useEffect(() => {
-    if (uploadPostKey) {
-      localStorage.setItem('uploadPostKey_v3', encrypt(uploadPostKey));
-    }
-    if (uploadUserId) {
-      localStorage.setItem('uploadUserId', uploadUserId);
-    }
+    persistBrowserCredential(localStorage, 'uploadPostKey_v3', encrypt(uploadPostKey));
+    persistBrowserCredential(localStorage, 'uploadUserId', uploadUserId);
   }, [uploadPostKey, uploadUserId]);
 
   useEffect(() => {
-    if (elevenLabsKey) {
-      localStorage.setItem('elevenLabsKey_v1', encrypt(elevenLabsKey));
-    }
+    persistBrowserCredential(localStorage, 'elevenLabsKey_v1', encrypt(elevenLabsKey));
   }, [elevenLabsKey]);
 
   useEffect(() => {
-    if (falKey) {
-      localStorage.setItem('falKey_v1', encrypt(falKey));
-    }
+    persistBrowserCredential(localStorage, 'falKey_v1', encrypt(falKey));
   }, [falKey]);
 
   useEffect(() => {
@@ -860,12 +869,14 @@ function App() {
   // no local key (the server resolves its own); BYOK sends the header.
   const fetchUserProfiles = async ({ silent = false } = {}) => {
     if (!uploadPostKey && !isManaged) return;
+    const generation = credentialGeneration.current;
     try {
       const res = await apiFetch('/api/social/user', {
         headers: uploadPostKey ? { 'X-Upload-Post-Key': uploadPostKey } : {}
       });
       if (!res.ok) throw new Error("Failed to fetch");
       const data = await res.json();
+      if (generation !== credentialGeneration.current) return;
       if (data.profiles && data.profiles.length > 0) {
         setUserProfiles(data.profiles);
         // Auto select first if none selected
@@ -1658,6 +1669,16 @@ function App() {
                 <div className="flex items-center gap-2 text-xs text-muted mt-1">
                   <Shield size={12} className="text-ok shrink-0" /> Privacy: keys only live in your browser (sent to backend just to process)
                 </div>
+              </div>
+              <div className="card p-4 mb-6 space-y-3">
+                <p className="text-xs text-muted leading-relaxed">
+                  Use a dedicated browser profile for agency work. Saved provider keys can be read by anyone with access to this profile.
+                  Forgetting them here does not revoke keys at the provider or remove server-configured keys.
+                </p>
+                <button onClick={handleForgetCredentials} className="btn-quiet py-2 px-4 text-sm">
+                  <KeyRound size={14} /> Forget saved API keys
+                </button>
+                {credentialNotice && <p role="status" className="text-xs text-muted">{credentialNotice}</p>}
               </div>
               {/* Self-hosted installs have no account page, so the agent
                   how-to lives here; cloud users get it (with OAuth) in Account. */}
